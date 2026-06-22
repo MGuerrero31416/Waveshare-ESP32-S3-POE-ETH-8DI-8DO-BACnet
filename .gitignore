@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+*.bin
+*.elf
+
+# ESP-IDF config
+sdkconfig
+sdkconfig.old
+
+# VS Code
+.vscode/
+
+# Private settings 
+main/User_Settings_Private.h

@@ -1,0 +1,1303 @@
+diff --git a/main/main.c b/main/main.c
+index be244f0..6565ae6 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -1,185 +1,512 @@
+ /* Minimal example: connect to Wi‑Fi and initialize BACnet. */
+ #include "driver/gpio.h"
+ #include <stddef.h>
+ #include <string.h>
+ #include <stdio.h>
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+ #include "freertos/semphr.h"
+ #include "esp_log.h"
+ #include "nvs_flash.h"
+ #include "esp_event.h"
++#include "esp_eth.h"
+ #include "esp_wifi.h"
+ #include "esp_netif.h"
++#include "lwip/inet.h"
+ #include "wifi_helper.h"
+-#include "display.h"
++#include "bacnet_network.h"
+ #include "waveshare_io.h"
++#include "ble_config.h"
+ #include "analog_value.h"
+ #include "binary_value.h"
+ #include "analog_input.h"
+ #include "binary_input.h"
+ #include "binary_output.h"
+-#include "sen54.h"
+ #include "mstp_rs485.h"
+ #include "User_Settings.h"
+ #include "bacnet_io_link.h"
+ #include "w5500_eth.h"
+ 
+-#if USER_ENABLE_RGB_STATUS
+-#include "rgb_status.h"
++#if ENABLE_DISPLAY
++#include "display.h"
+ #endif
+ 
+-/* Temporary: skip SEN54, TFT, and MAX485 (MS/TP) to avoid GPIO conflicts
+- * while porting to a new board. Set to 0 to re-enable peripherals. */
+-#define SKIP_PERIPHERALS 1
++#if ENABLE_SEN54
++#include "sen54.h"
++#endif
+ 
+-/* bacnet-stack headers */
++/* BACnet stack headers */
++#include "bacnet/config.h"
++#include "bacnet/basic/services.h"
++#include "bacnet/basic/service/h_apdu.h"
++#include "bacnet/datalink/datalink.h"
+ #include "bacnet/basic/object/device.h"
++#include "bacnet/basic/binding/address.h"
++#include "bacnet/basic/tsm/tsm.h"
++#include "bacnet/datalink/bip.h"
++/* BACnet object helpers */
+ #include "bacnet/basic/object/av.h"
+ #include "bacnet/basic/object/bv.h"
+ #include "bacnet/basic/object/ai.h"
+ #include "bacnet/basic/object/bi.h"
+ #include "bacnet/basic/object/bo.h"
+-#include "bacnet/basic/service/s_iam.h"
+-#include "bacnet/basic/tsm/tsm.h"
+-#include "bacnet/bacaddr.h"
+-#include "bacnet/basic/bbmd/h_bbmd.h"
+-#include "bacnet/datalink/datalink.h"
+-#include "bacnet/datalink/bip.h"
+-#include "bacnet/datalink/dlmstp.h"
++
++/* MSTP types */
+ #include "bacnet/datalink/mstp.h"
+-/* service handlers from bacnet-stack library */
+-#include "bacnet/basic/services.h"
+-#include "bacnet/basic/service/h_rp.h"
+-#include "bacnet/basic/service/h_rpm.h"
+-#include "bacnet/basic/service/h_wp.h"
+-#include "bacnet/basic/service/h_whois.h"
+-#include "bacnet/basic/service/h_iam.h"
+-#include "bacnet/basic/service/h_cov.h"
+-#include "bacnet/basic/service/s_whois.h"
+-#include "bacnet/npdu.h"
+-#include "bacnet/basic/npdu/h_npdu.h"
+-#include "bacnet/bacenum.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#if USER_ENABLE_RGB_STATUS
++#include "rgb_status.h"
++#endif
++
++#include "esp_heap_caps.h"
+ 
+ static const char *TAG = "bacnet";
+ 
++#if CONFIG_FREERTOS_UNICORE
++#define BACNET_TASK_CORE tskNO_AFFINITY
++#else
++#define BACNET_TASK_CORE 1
++#endif
++
+ int override_nvs_on_flash = 0;  /* Exported for AV/BV modules */
+ 
++/* Guard to ensure BACnet/IP is only initialized once */
++static bool bacnet_ip_initialized = false;
++static bool bacnet_bip_initialized = false;
++static bool bacnet_objects_ready = false;
++static bool bacnet_eth_has_ip = false;
++static bool bacnet_wifi_has_ip = false;
++static const char *bacnet_active_ifkey = NULL;
+ 
++/* Static task storage for BACnet critical tasks to avoid heap fragmentation on startup */
++static SemaphoreHandle_t bacnet_datalink_mutex = NULL;
++static EventGroupHandle_t bacnet_network_event_group = NULL;
++static esp_event_handler_instance_t bacnet_eth_event_instance = NULL;
++static esp_event_handler_instance_t bacnet_ip_event_instance = NULL;
++
++/* Static storage for BACnet RTOS objects referenced across modules */
++static TaskHandle_t bacnet_network_task_handle = NULL;
++static StackType_t bacnet_network_stack[(4096 / sizeof(StackType_t))];
++static StaticTask_t bacnet_network_task_buffer;
++static TaskHandle_t bacnet_rx_task_handle = NULL;
++static StackType_t bacnet_rx_stack[(16384 / sizeof(StackType_t))];
++static StaticTask_t bacnet_rx_task_buffer;
++static TaskHandle_t bacnet_mstp_task_handle = NULL;
++
++static TaskHandle_t bacnet_io_task_handle = NULL;
++static StackType_t bacnet_io_stack[(4096 / sizeof(StackType_t))];
++static StaticTask_t bacnet_io_task_buffer;
++
++static TaskHandle_t bacnet_cov_task_handle __attribute__((unused)) = NULL;
++static StackType_t bacnet_cov_stack[(8192 / sizeof(StackType_t))] __attribute__((unused));
++static StaticTask_t bacnet_cov_task_buffer __attribute__((unused));
++
++/* Forward declarations of tasks used below */
++#if ENABLE_SEN54
++static void sen54_task(void *pvParameters);
++#endif
+ static void bacnet_register_with_bbmd(void);
++static void bacnet_bip_network_ready(void);
++static void bacnet_network_task(void *pvParameters);
++static esp_err_t bacnet_start_bip_on_interface(const char *ifkey, const char *label);
++static void bacnet_network_select_transport(void);
++static void bacnet_start_receive_task(void);
++static bool bacnet_mstp_init(void);
++static bool bacnet_update_bip_addresses(const char *ifkey, const char *label);
++static void bacnet_log_task_create_request(const char *task_name, unsigned stack_bytes, int core_id);
++static void bacnet_log_task_create_result(const char *task_name, TaskHandle_t task_handle, unsigned stack_bytes, int core_id);
++
++/* Forward prototypes for functions used before their definitions */
++bool bacnet_datalink_lock(const char *name);
++void bacnet_datalink_unlock(void);
+ static void bacnet_receive_task(void *pvParameters);
+-static void bacnet_mstp_receive_task(void *pvParameters);
+-static void bacnet_cov_task(void *pvParameters);
+-static void sen54_task(void *pvParameters);
+-static TaskHandle_t bacnet_cov_task_handle = NULL;
+-static SemaphoreHandle_t bacnet_datalink_mutex = NULL;
+-static volatile uint32_t mstp_pdu_count = 0;
+-static volatile uint32_t mstp_apdu_count = 0;
+-static volatile uint32_t mstp_rp_total = 0;
+-static volatile uint32_t mstp_wp_total = 0;
++static void __attribute__((unused)) bacnet_mstp_receive_task(void *pvParameters);
++static void __attribute__((unused)) bacnet_cov_task(void *pvParameters);
++void bacnet_network_notify(uint32_t event_bits);
++static void bacnet_eth_event_handler(void *arg, esp_event_base_t event_base,
++                                     int32_t event_id, void *event_data);
++
++/* Forward declarations for datalink name symbols defined later in this file */
++static char datalink_bip[];
++static char datalink_mstp[];
++static char *datalink_default;
++
++/* MSTP counters used in MSTP receive task */
++static unsigned long mstp_pdu_count = 0;
++static unsigned long mstp_apdu_count = 0;
++static unsigned long mstp_rp_total = 0;
+ static float mstp_rp_last_value = 0.0f;
++static unsigned long mstp_wp_total = 0;
+ 
+-static bool wifi_connected_now(void)
++void app_main(void)
+ {
+-    if (!USER_ENABLE_BACNET_IP) {
+-        return false;
+-    }
+ 
+-    wifi_ap_record_t ap_info = {0};
+-    return esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+-}
++    ESP_LOGI(TAG, "[BOOT 1/7] Core init: APP_MAIN STARTED");
+ 
+-static void wifi_ip_string_now(char *out, size_t out_len)
+-{
+-    if (!out || out_len == 0) {
+-        return;
++    /* Core system init: NVS, logging, event loop, network infra */
++    esp_err_t ret = nvs_flash_init();
++
++    bacnet_datalink_mutex = xSemaphoreCreateRecursiveMutex();
++    if (!bacnet_datalink_mutex) {
++        ESP_LOGE(TAG, "Failed to create BACnet datalink mutex");
+     }
+ 
+-    out[0] = '\0';
+-    if (!USER_ENABLE_BACNET_IP) {
+-        snprintf(out, out_len, "No IP");
+-        return;
++    override_nvs_on_flash = USER_OVERRIDE_NVS_ON_FLASH;
++    if (override_nvs_on_flash && USER_WIFI_SSID[0] == '\0') {
++        ESP_LOGW(TAG, "OVERRIDE_NVS_ON_FLASH ignored: USER_WIFI_SSID is empty and erase would remove provisioned Wi-Fi credentials");
++        override_nvs_on_flash = 0;
+     }
+ 
+-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+-    if (!netif) {
+-        snprintf(out, out_len, "No IP");
+-        return;
++    if (override_nvs_on_flash) {
++        ESP_LOGI(TAG, "Override flag set - erasing NVS to reset to defaults");
++        nvs_flash_erase();
++        ret = nvs_flash_init();
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Failed to reinitialize NVS after erase: %d", ret);
++        } else {
++            ESP_LOGI(TAG, "NVS reinitialized successfully");
++        }
++    } else if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
++        ESP_LOGI(TAG, "NVS needs initialization");
++        nvs_flash_erase();
++        nvs_flash_init();
++    } else if (ret == ESP_OK) {
++        ESP_LOGI(TAG, "NVS initialized from existing data");
+     }
+ 
+-    esp_netif_ip_info_t ip_info = {0};
+-    if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+-        snprintf(out, out_len, IPSTR, IP2STR(&ip_info.ip));
++#if USER_ENABLE_RGB_STATUS
++    /* Initialize RGB status indicator early (non-blocking) */
++    rgb_status_init();
++    rgb_status_set_booting();
++#endif
++
++    /* Network infra (esp-netif + event loop) */
++    ESP_LOGI(TAG, "[BOOT 1/7] Heap snapshot before network infra: free=%u largest=%u",
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++    esp_netif_init();
++    esp_event_loop_create_default();
++    ESP_LOGI(TAG, "[BOOT 1/7] Core init complete");
++
++    bacnet_network_event_group = xEventGroupCreate();
++    if (!bacnet_network_event_group) {
++        ESP_LOGE(TAG, "Failed to create BACnet network event group");
++    }
++
++    bacnet_network_task_handle = xTaskCreateStaticPinnedToCore(
++        bacnet_network_task,
++        "bacnet_net",
++        (4096 / sizeof(StackType_t)),
++        NULL,
++        tskIDLE_PRIORITY + 3,
++        bacnet_network_stack,
++        &bacnet_network_task_buffer,
++        BACNET_TASK_CORE);
++    if (bacnet_network_task_handle == NULL) {
++        ESP_LOGE(TAG, "Failed to create BACnet network task");
++    } else {
++        bacnet_log_task_create_result("bacnet_net", bacnet_network_task_handle, 4096, BACNET_TASK_CORE);
++    }
++
++    esp_err_t evret = esp_event_handler_instance_register(
++        ETH_EVENT,
++        ESP_EVENT_ANY_ID,
++        &bacnet_eth_event_handler,
++        NULL,
++        &bacnet_eth_event_instance);
++    if (evret != ESP_OK) {
++        ESP_LOGE(TAG, "Failed to register ETH event handler: %d", evret);
++    }
++
++    evret = esp_event_handler_instance_register(
++        IP_EVENT,
++        IP_EVENT_ETH_GOT_IP,
++        &bacnet_eth_event_handler,
++        NULL,
++        &bacnet_ip_event_instance);
++    if (evret != ESP_OK) {
++        ESP_LOGE(TAG, "Failed to register ETH got-IP handler: %d", evret);
++    }
++
++    /* Stage 2: Ethernet init */
++    ESP_LOGI(TAG, "[BOOT 2/7] Ethernet init starting");
++    if (USER_ENABLE_ETHERNET) {
++        ESP_LOGI(TAG, "USER_ENABLE_ETHERNET set: initializing W5500 Ethernet");
++        /* TEMP HARDWARE RESET TEST (REMOVE AFTER DEBUG) */
++        gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
++        gpio_set_level(GPIO_NUM_4, 0);
++        vTaskDelay(pdMS_TO_TICKS(200));
++        gpio_set_level(GPIO_NUM_4, 1);
++        ESP_LOGI(TAG, "RESET TEST TOGGLE DONE");
++
++        ESP_LOGI(TAG, ">>> ABOUT TO CALL w5500_eth_init()");
++        ESP_LOGI(TAG, "[BOOT 2/7] Heap before w5500_eth_init: free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++        if (w5500_eth_init(USER_ETH_USE_STATIC_IP) != ESP_OK) {
++            ESP_LOGE(TAG, "W5500 Ethernet init failed");
++        } else {
++#if USER_ENABLE_RGB_STATUS
++            rgb_status_set_waiting_for_ip();
++#endif
++            ESP_LOGI(TAG, "W5500 Ethernet initialized (waiting for IP)");
++        }
+     } else {
+-        snprintf(out, out_len, "No IP");
++        ESP_LOGI(TAG, "Ethernet disabled by configuration");
+     }
+-}
++    ESP_LOGI(TAG, "[BOOT 2/7] Ethernet init complete");
+ 
+-static void bacnet_log_whois_iam(const uint8_t *apdu, int apdu_len, const char *link)
+-{
+-    if (!apdu || apdu_len < 2) {
+-        return;
++    /* Stage 3: BACnet stack will be initialized after Ethernet IP event. Do not init here. */
++    ESP_LOGI(TAG, "[BOOT 3/7] BACnet deferred until network-ready (Ethernet IP or WiFi fallback)");
++
++    /* Stage 4: IO expander + sensor initialization */
++    ESP_LOGI(TAG, "[BOOT 4/7] IO and sensor initialization starting");
++    ESP_LOGI(TAG, "[BOOT 4/7] Heap before IO init: free=%u largest=%u",
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++    /* Initialize Waveshare IO (TCA9554) early to avoid later contention */
++    waveshare_io_init();
++    ESP_LOGI(TAG, "[BOOT 4/7] Waveshare IO init complete");
++
++    /* Start sensor tasks early (non-blocking) */
++#if ENABLE_SEN54 && !SKIP_PERIPHERALS
++    if (xTaskCreate(sen54_task, "sen54", 4096, NULL, 3, NULL) != pdPASS) {
++        ESP_LOGE(TAG, "Failed to create sen54 task (sen54_task)");
++    } else {
++        ESP_LOGI(TAG, "sen54 task started");
+     }
++#else
++    ESP_LOGI(TAG, "Sensor init skipped (SKIP_PERIPHERALS)");
++#endif
++    ESP_LOGI(TAG, "[BOOT 4/7] IO and sensor initialization complete");
++
++    /* Stage 5: BLE initialization (single owner) */
++    ESP_LOGI(TAG, "[BOOT 5/7] BLE initialization starting");
++    ESP_LOGI(TAG, "[BOOT 5/7] Heap before BLE init: free=%u largest=%u",
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++    /* Call the single BLE init entry point once */
++    ble_config_init();
++    ESP_LOGI(TAG, "[BOOT 5/7] BLE initialization complete");
++
++    /* Stage 6: WiFi initialization as secondary/fallback */
++    ESP_LOGI(TAG, "[BOOT 6/7] WiFi initialization starting");
++    ESP_LOGI(TAG, "[BOOT 6/7] Heap before WiFi init: free=%u largest=%u",
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++    if (USER_ENABLE_BACNET_IP_WIFI) {
++        /* WiFi is always brought up as fallback transport; BACnet/IP startup is task-owned. */
++        wifi_init_sta();
++    } else {
++        ESP_LOGI(TAG, "WiFi disabled by configuration");
++    }
++    ESP_LOGI(TAG, "[BOOT 6/7] WiFi initialization complete");
+ 
+-    uint8_t pdu_type = apdu[0] & 0xF0;
+-    if (pdu_type != PDU_TYPE_UNCONFIRMED_SERVICE_REQUEST) {
+-        return;
++    /* Stage 7: UI, RGB, buzzer, and remaining BACnet object initialization */
++    ESP_LOGI(TAG, "[BOOT 7/7] UI and final BACnet object initialization starting");
++    ESP_LOGI(TAG, "[BOOT 7/7] Heap before BACnet objects: free=%u largest=%u",
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++
++    if (USER_ENABLE_BACNET_IP_WIFI && !USER_ENABLE_ETHERNET) {
++        datalink_default = datalink_bip;
++    } 
++#if !SKIP_PERIPHERALS
++    else if (USER_ENABLE_BACNET_MSTP) {
++        datalink_default = datalink_mstp;
++    }
++#endif
++    if (datalink_default) {
++        datalink_set(datalink_default);
++    }
++
++    Device_Init(NULL);
++    Device_Set_Object_Instance_Number(USER_BACNET_DEVICE_INSTANCE);
++    Device_Set_Vendor_Identifier(260);
++    Device_Object_Name_ANSI_Init(USER_BACNET_DEVICE_NAME);
++
++    ESP_LOGI(TAG, "Registering BACnet service handlers");
++    apdu_set_unconfirmed_handler(SERVICE_UNCONFIRMED_I_AM, handler_i_am_add);
++    apdu_set_unconfirmed_handler(SERVICE_UNCONFIRMED_WHO_IS, handler_who_is);
++    apdu_set_unrecognized_service_handler_handler(handler_unrecognized_service);
++    apdu_set_confirmed_handler(SERVICE_CONFIRMED_READ_PROPERTY, handler_read_property);
++    apdu_set_confirmed_handler(SERVICE_CONFIRMED_READ_PROP_MULTIPLE, handler_read_property_multiple);
++    apdu_set_confirmed_handler(SERVICE_CONFIRMED_WRITE_PROPERTY, handler_write_property);
++
++    apdu_set_confirmed_handler(SERVICE_CONFIRMED_SUBSCRIBE_COV, handler_cov_subscribe);
++    apdu_set_confirmed_handler(SERVICE_CONFIRMED_SUBSCRIBE_COV_PROPERTY, handler_cov_subscribe_property);
++    handler_cov_init();
++
++    /* Create BACnet objects (AV, BV, AI, BI, BO) */
++    bacnet_create_analog_values();
++    bacnet_create_binary_values();
++    bacnet_create_analog_inputs();
++    bacnet_create_binary_inputs();
++    bacnet_create_binary_outputs_with_gpio_sync();
++
++    bacnet_objects_ready = (Analog_Value_Count() == USER_AV_COUNT) &&
++        (Binary_Value_Count() == USER_BV_COUNT) &&
++        (Analog_Input_Count() == USER_AI_COUNT) &&
++        (Binary_Input_Count() == USER_BI_COUNT) &&
++        (Binary_Output_Count() == USER_BO_COUNT);
++
++    if (!bacnet_objects_ready) {
++        ESP_LOGE(TAG,
++                 "BACnet object tables incomplete after init (AV=%u/%u BV=%u/%u AI=%u/%u BI=%u/%u BO=%u/%u); COV task will not start",
++                 (unsigned)Analog_Value_Count(), (unsigned)USER_AV_COUNT,
++                 (unsigned)Binary_Value_Count(), (unsigned)USER_BV_COUNT,
++                 (unsigned)Analog_Input_Count(), (unsigned)USER_AI_COUNT,
++                 (unsigned)Binary_Input_Count(), (unsigned)USER_BI_COUNT,
++                 (unsigned)Binary_Output_Count(), (unsigned)USER_BO_COUNT);
++    }
++
++    ESP_LOGI(TAG, "Initializing bacnet_io link and Waveshare IO");
++    bacnet_io_link_init();
++
++    if (USER_ENABLE_BACNET_MSTP) {
++        if (bacnet_mstp_init()) {
++            if (bacnet_mstp_task_handle != NULL) {
++                ESP_LOGW(TAG, "bacnet_mstp task already created; skipping duplicate request");
++            } else {
++                bacnet_log_task_create_request("bacnet_mstp", 4096, BACNET_TASK_CORE);
++                BaseType_t created = xTaskCreatePinnedToCore(
++                    bacnet_mstp_receive_task, "bacnet_mstp", 4096, NULL, 5,
++                    &bacnet_mstp_task_handle, BACNET_TASK_CORE);
++                if (created != pdPASS || bacnet_mstp_task_handle == NULL) {
++                    ESP_LOGE(TAG, "Failed to create bacnet_mstp task (created=%d handle=%p)",
++                             (int)created, (void *)bacnet_mstp_task_handle);
++                    bacnet_mstp_task_handle = NULL;
++                } else {
++                    bacnet_log_task_create_result("bacnet_mstp", bacnet_mstp_task_handle, 4096, BACNET_TASK_CORE);
++                }
++            }
++        } else {
++            ESP_LOGW(TAG, "BACnet MS/TP init failed; MSTP task not started");
++        }
++    }
++
++    if (bacnet_objects_ready) {
++#if 0
++        bacnet_log_task_create_request("bacnet_cov", 8192, BACNET_TASK_CORE);
++        bacnet_cov_task_handle = xTaskCreateStaticPinnedToCore(
++            bacnet_cov_task,
++            "bacnet_cov",
++            (8192 / sizeof(StackType_t)),
++            NULL,
++            tskIDLE_PRIORITY + 1,
++            bacnet_cov_stack,
++            &bacnet_cov_task_buffer,
++            BACNET_TASK_CORE);
++        if (bacnet_cov_task_handle == NULL) {
++            ESP_LOGE(TAG, "Failed to create bacnet_cov static task");
++        } else {
++            bacnet_log_task_create_result("bacnet_cov", bacnet_cov_task_handle, 8192, BACNET_TASK_CORE);
++        }
++#endif
++    }
++
++    /* Start BACnet IO link task to sync BO->DO and DI->BI periodically */
++    /* Create bacnet_io_link task with static storage to avoid heap fragmentation
++     * and improve reliability of task creation during startup. */
++    bacnet_log_task_create_request("bacnet_io", 4096, BACNET_TASK_CORE);
++    bacnet_io_task_handle = xTaskCreateStaticPinnedToCore(
++        bacnet_io_link_task,
++        "bacnet_io",
++        (4096 / sizeof(StackType_t)),
++        NULL,
++        tskIDLE_PRIORITY + 2,
++        bacnet_io_stack,
++        &bacnet_io_task_buffer,
++        BACNET_TASK_CORE);
++    if (bacnet_io_task_handle == NULL) {
++        ESP_LOGE(TAG, "Failed to create bacnet_io_link static task");
++    } else {
++        bacnet_log_task_create_result("bacnet_io", bacnet_io_task_handle, 4096, BACNET_TASK_CORE);
+     }
+ 
+-    uint8_t service_choice = apdu[1];
+-    (void)service_choice;
+-    (void)link;
+ }
+ 
+ static char datalink_bip[] = "bip";
+ static char datalink_mstp[] = "mstp";
+ static char *datalink_default = NULL;
+ 
+ static uint8_t mstp_rx_buffer[512];
+ static uint8_t mstp_tx_buffer[512];
+ static struct mstp_port_struct_t mstp_port;
+ static struct dlmstp_user_data_t mstp_user;
+ static struct dlmstp_rs485_driver mstp_rs485_driver = {
+     .init = MSTP_RS485_Init,
+     .send = MSTP_RS485_Send,
+     .read = MSTP_RS485_Read,
+     .transmitting = MSTP_RS485_Transmitting,
+     .baud_rate = MSTP_RS485_Baud_Rate,
+     .baud_rate_set = MSTP_RS485_Baud_Rate_Set,
+     .silence_milliseconds = MSTP_RS485_Silence_Milliseconds,
+     .silence_reset = MSTP_RS485_Silence_Reset
+ };
+ 
+-static void bacnet_datalink_lock(char *name)
++bool bacnet_datalink_lock(const char *name)
+ {
+-    if (bacnet_datalink_mutex) {
+-        xSemaphoreTake(bacnet_datalink_mutex, portMAX_DELAY);
++    if (xPortInIsrContext() || !bacnet_datalink_mutex) {
++        return false;
++    }
++
++    if (xSemaphoreTakeRecursive(bacnet_datalink_mutex, pdMS_TO_TICKS(2500)) != pdTRUE) {
++        return false;
++    }
++
++    if (name != NULL) {
++        datalink_set((char *)name);
+     }
+-    datalink_set(name);
++    return true;
++}
++
++static void bacnet_log_task_create_request(const char *task_name, unsigned stack_bytes, int core_id)
++{
++    ESP_LOGI(TAG, "Task create request: name=%s stack=%u core=%d", task_name, stack_bytes, core_id);
++}
++
++static void bacnet_log_task_create_result(const char *task_name, TaskHandle_t task_handle, unsigned stack_bytes, int core_id)
++{
++    ESP_LOGI(TAG, "Task created: name=%s handle=%p stack=%u core=%d", task_name, (void *)task_handle, stack_bytes, core_id);
+ }
+ 
+-static void bacnet_datalink_unlock(void)
++void bacnet_datalink_unlock(void)
+ {
++    if (xPortInIsrContext() || !bacnet_datalink_mutex) {
++        return;
++    }
++
++    TaskHandle_t holder = xSemaphoreGetMutexHolder(bacnet_datalink_mutex);
++    TaskHandle_t self = xTaskGetCurrentTaskHandle();
++    if (holder != self) {
++        return;
++    }
++
+     if (datalink_default) {
+         datalink_set(datalink_default);
+     }
+-    if (bacnet_datalink_mutex) {
+-        xSemaphoreGive(bacnet_datalink_mutex);
++
++    if (xSemaphoreGiveRecursive(bacnet_datalink_mutex) != pdTRUE) {
++        return;
+     }
+ }
+ 
+-static bool bacnet_mstp_init(void)
++static bool __attribute__((unused)) bacnet_mstp_init(void)
+ {
+     MSTP_RS485_Init();
+ 
+     memset(&mstp_port, 0, sizeof(mstp_port));
+     memset(&mstp_user, 0, sizeof(mstp_user));
+ 
+     mstp_user.RS485_Driver = &mstp_rs485_driver;
+     mstp_port.UserData = &mstp_user;
+     mstp_port.InputBuffer = mstp_rx_buffer;
+     mstp_port.InputBufferSize = sizeof(mstp_rx_buffer);
+     mstp_port.OutputBuffer = mstp_tx_buffer;
+     mstp_port.OutputBufferSize = sizeof(mstp_tx_buffer);
+ 
+     dlmstp_set_interface((const char *)&mstp_port);
+@@ -187,93 +514,98 @@ static bool bacnet_mstp_init(void)
+     dlmstp_set_max_info_frames(USER_MSTP_MAX_INFO_FRAMES);
+     dlmstp_set_max_master(USER_MSTP_MAX_MASTER);
+     dlmstp_set_baud_rate(USER_MSTP_BAUD_RATE);
+     dlmstp_slave_mode_enabled_set(false);
+ 
+     bool ok = dlmstp_init((char *)&mstp_port);
+ #if USER_ENABLE_RGB_STATUS
+     if (ok) {
+         rgb_status_set_mstp_ready();
+     }
+ #endif
+     return ok;
+ }
+ 
+-/* Ethernet IP event handler - starts BACnet B/IP when Ethernet gets an IP */
+-static void eth_got_ip_event_handler(void *arg, esp_event_base_t event_base,
+-                                     int32_t event_id, void *event_data)
+-{
+-    (void)arg;
+-    if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+-        char ipstr[32];
+-        snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&event->ip_info.ip));
+-        ESP_LOGI(TAG, "Ethernet acquired IP: %s", ipstr);
+-
+-        ESP_LOGI(TAG, "Initializing BACnet stack (B/IP) after Ethernet IP");
+-        datalink_set(datalink_bip);
+-        if (!datalink_init(NULL)) {
+-            ESP_LOGE(TAG, "Failed to initialize BACnet datalink after Ethernet IP");
+-            return;
+-        }
+-        bacnet_register_with_bbmd();
+-    #if USER_ENABLE_RGB_STATUS
+-        rgb_status_set_bacnet_ready();
+-    #endif
+-        /* Mark B/IP as default datalink now that it's initialized */
+-        datalink_default = datalink_bip;
+-        /* BACnet/IP initialized after Ethernet IP; I-Am will be sent from main loop */
+-    }
+-}
+-
+ /* BACnet receive task - processes incoming BACnet messages */
+ static void bacnet_receive_task(void *pvParameters)
+ {
+     (void)pvParameters;
+     BACNET_ADDRESS src = {0};
+     static uint8_t rx_buffer[600];  /* Smaller buffer in DRAM */
+     uint16_t pdu_len = 0;
+ 
+     ESP_LOGI(TAG, "BACnet receive task started");
+ 
+     while (1) {
++        if (!bacnet_ip_initialized) {
++            vTaskDelay(pdMS_TO_TICKS(50));
++            continue;
++        }
++
+         /* Poll for incoming BACnet messages */
+         memset(&src, 0, sizeof(src));
+         pdu_len = bip_receive(&src, rx_buffer, sizeof(rx_buffer), 100);
+         if (pdu_len > 0) {
+             /* Save original source from UDP socket before NPDU decode modifies it */
+             BACNET_ADDRESS orig_src = src;
+             BACNET_ADDRESS dest = {0};
+             BACNET_NPDU_DATA npdu_data = {0};
+             int apdu_offset = bacnet_npdu_decode(
+                 rx_buffer, pdu_len, &dest, &src, &npdu_data);
+             /* If NPDU didn't have source routing info, restore from UDP socket */
+             if (src.len == 0) {
+                 src = orig_src;
+             }
+             if (apdu_offset > 0 && apdu_offset < (int)pdu_len) {
+-                bacnet_log_whois_iam(&rx_buffer[apdu_offset], pdu_len - apdu_offset, "bip");
+-                bacnet_datalink_lock(datalink_bip);
+-                apdu_handler(&src, &rx_buffer[apdu_offset], pdu_len - apdu_offset);
+-                bacnet_datalink_unlock();
++                ESP_LOGD(TAG, "Received BACnet APDU (bip), len=%u", (unsigned)(pdu_len - apdu_offset));
++                if (bacnet_datalink_lock(datalink_bip)) {
++                    apdu_handler(&src, &rx_buffer[apdu_offset], pdu_len - apdu_offset);
++                    bacnet_datalink_unlock();
++                }
+             }
+         }
+         vTaskDelay(pdMS_TO_TICKS(10));
+     }
+ }
+ 
++static void bacnet_start_receive_task(void)
++{
++    if (bacnet_rx_task_handle != NULL) {
++        return;
++    }
++
++    size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_8BIT);
++    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
++    UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
++    ESP_LOGI(TAG, "Heap before bacnet_rx create: free=%u largest=%u current_task_stack_hwm=%u", (unsigned)free_bytes, (unsigned)largest, (unsigned)hwm);
++    bacnet_rx_task_handle = xTaskCreateStaticPinnedToCore(
++        bacnet_receive_task,
++        "bacnet_rx",
++        (16384 / sizeof(StackType_t)),
++        NULL,
++        5,
++        bacnet_rx_stack,
++        &bacnet_rx_task_buffer,
++        BACNET_TASK_CORE);
++    if (bacnet_rx_task_handle == NULL) {
++        ESP_LOGE(TAG, "Failed to create bacnet_rx static task");
++    } else {
++        ESP_LOGI(TAG, "bacnet_rx static task started");
++    }
++}
++
+ /* BACnet MS/TP receive task - processes incoming MS/TP frames */
+-static void bacnet_mstp_receive_task(void *pvParameters)
++static void __attribute__((unused)) bacnet_mstp_receive_task(void *pvParameters)
+ {
+     (void)pvParameters;
+     BACNET_ADDRESS src = {0};
+     static uint8_t rx_buffer[600];
+     uint16_t pdu_len = 0;
+ 
+     ESP_LOGI(TAG, "BACnet MS/TP receive task started");
+ 
+     while (1) {
+         memset(&src, 0, sizeof(src));
+         pdu_len = dlmstp_receive(&src, rx_buffer, sizeof(rx_buffer), 0);
+         if (pdu_len > 0) {
+             mstp_pdu_count++;
+             /* MS/TP activity no longer flashes RGB; persistent MS/TP ready state is set when interface initializes */
+@@ -284,366 +616,82 @@ static void bacnet_mstp_receive_task(void *pvParameters)
+             if (apdu_offset > 0 && apdu_offset < (int)pdu_len) {
+                 mstp_apdu_count++;
+                 if ((apdu_offset + 4) <= (int)pdu_len) {
+                     uint8_t pdu_type = rx_buffer[apdu_offset] & 0xF0;
+                     uint8_t service_choice = rx_buffer[apdu_offset + 3];
+                     if (pdu_type == PDU_TYPE_CONFIRMED_SERVICE_REQUEST &&
+                         service_choice == SERVICE_CONFIRMED_READ_PROPERTY) {
+                         mstp_rp_total++;
+                         mstp_rp_last_value = Analog_Value_Present_Value(1);
+                     } else if (pdu_type == PDU_TYPE_CONFIRMED_SERVICE_REQUEST &&
+                         service_choice == SERVICE_CONFIRMED_WRITE_PROPERTY) {
+                         mstp_wp_total++;
+                     }
+                 }
+-                bacnet_log_whois_iam(&rx_buffer[apdu_offset], pdu_len - apdu_offset, "mstp");
+-                bacnet_datalink_lock(datalink_mstp);
+-                apdu_handler(&src, &rx_buffer[apdu_offset], pdu_len - apdu_offset);
+-                bacnet_datalink_unlock();
++                ESP_LOGD(TAG, "Received BACnet APDU (mstp), len=%u", (unsigned)(pdu_len - apdu_offset));
++                if (bacnet_datalink_lock(datalink_mstp)) {
++                    apdu_handler(&src, &rx_buffer[apdu_offset], pdu_len - apdu_offset);
++                    bacnet_datalink_unlock();
++                }
+             } else {
+                 ESP_LOGW(TAG, "MS/TP RX frame decode failed: len=%u apdu_offset=%d src.len=%u src.mac=%u",
+                     (unsigned)pdu_len, apdu_offset, (unsigned)src.len,
+                     (unsigned)(src.len ? src.mac[0] : 0));
+             }
+         }
+         vTaskDelay(pdMS_TO_TICKS(1));
+     }
+ }
+ 
+-/* Application entry: init Wi‑Fi and BACnet */
+-void app_main(void)
+-{
+-
+-    ESP_LOGE("DEBUG", "APP_MAIN STARTED");
+-
+-    esp_err_t ret = nvs_flash_init();
+-
+-    bacnet_datalink_mutex = xSemaphoreCreateMutex();
+-    if (!bacnet_datalink_mutex) {
+-        ESP_LOGE(TAG, "Failed to create BACnet datalink mutex");
+-    }
+-    
+-    /* If OVERRIDE_NVS_ON_FLASH is set, erase NVS to reset to code defaults.
+-     * Guard against wiping provisioned Wi-Fi when no compile-time defaults exist.
+-     */
+-    override_nvs_on_flash = USER_OVERRIDE_NVS_ON_FLASH;
+-    if (override_nvs_on_flash && USER_WIFI_SSID[0] == '\0') {
+-        ESP_LOGW(TAG, "OVERRIDE_NVS_ON_FLASH ignored: USER_WIFI_SSID is empty and erase would remove provisioned Wi-Fi credentials");
+-        override_nvs_on_flash = 0;
+-    }
+-
+-    if (override_nvs_on_flash) {
+-        ESP_LOGI(TAG, "Override flag set - erasing NVS to reset to defaults");
+-        nvs_flash_erase();
+-        ret = nvs_flash_init();
+-        if (ret != ESP_OK) {
+-            ESP_LOGE(TAG, "Failed to reinitialize NVS after erase: %d", ret);
+-        } else {
+-            ESP_LOGI(TAG, "NVS reinitialized successfully");
+-        }
+-    } else if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+-        ESP_LOGI(TAG, "NVS needs initialization");
+-        nvs_flash_erase();
+-        nvs_flash_init();
+-    } else if (ret == ESP_OK) {
+-        ESP_LOGI(TAG, "NVS initialized from existing data");
+-    }
+-
+-#if USER_ENABLE_RGB_STATUS
+-    /* Initialize RGB status indicator early (non-blocking) */
+-    rgb_status_init();
+-    rgb_status_set_booting();
+-#endif
+-
+-    if (USER_ENABLE_BACNET_IP) {
+-        /* Initialize network stack (must be done before WiFi init or Ethernet init) */
+-        esp_netif_init();
+-        esp_event_loop_create_default();
+-
+-        ESP_LOGE("DEBUG", "BEFORE USER_ENABLE_ETHERNET CHECK");
+-
+-        if (USER_ENABLE_ETHERNET) {
+-            /* Initialize W5500 Ethernet and defer BACnet B/IP startup until IP_EVENT_ETH_GOT_IP */
+-            ESP_LOGI(TAG, "USER_ENABLE_ETHERNET set: initializing W5500 Ethernet");
+-
+-                // 🔧 TEMP HARDWARE RESET TEST (REMOVE AFTER DEBUG)
+-                gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+-                gpio_set_level(GPIO_NUM_4, 0);
+-                vTaskDelay(pdMS_TO_TICKS(200));
+-                gpio_set_level(GPIO_NUM_4, 1);
+-                ESP_LOGI(TAG, "RESET TEST TOGGLE DONE");
+-
+-            ESP_LOGE(TAG, ">>> ABOUT TO CALL w5500_eth_init()");   // <-- ADD THIS
+-
+-            if (w5500_eth_init(USER_ETH_USE_STATIC_IP) != ESP_OK) {
+-                ESP_LOGE(TAG, "W5500 Ethernet init failed");
+-            } else {
+-                /* Indicate Ethernet is up and waiting for IP assignment */
+-#if USER_ENABLE_RGB_STATUS
+-                rgb_status_set_waiting_for_ip();
+-#endif
+-            }
+-            /* Register handler to start BACnet after Ethernet gets IP */
+-            esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_got_ip_event_handler, NULL);
+-        } else {
+-            /* Wi‑Fi path (unchanged) */
+-            wifi_init_sta();
+-
+-            ESP_LOGI(TAG, "Initializing BACnet stack (B/IP)");
+-            datalink_set(datalink_bip);
+-            if (!datalink_init(NULL)) {
+-                ESP_LOGE(TAG, "Failed to initialize BACnet datalink");
+-                return;
+-            }
+-
+-            bacnet_register_with_bbmd();
+-        }
+-    }
+-
+-/* MS/TP: compile-time control via USER_ENABLE_MSTP. */
+-#if USER_ENABLE_MSTP
+-#if !SKIP_PERIPHERALS
+-    if (USER_ENABLE_BACNET_MSTP) {
+-        ESP_LOGI(TAG, "Initializing BACnet MS/TP");
+-        if (!bacnet_mstp_init()) {
+-            ESP_LOGE(TAG, "Failed to initialize BACnet MS/TP datalink");
+-        } else {
+-            /* Detailed startup logging */
+-            ESP_LOGI(TAG,
+-                     "MS/TP startup: UART=%d TX=%d RX=%d DE=%d MAC=%u Baud=%u",
+-                     MSTP_RS485_Uart_Port(),
+-                     MSTP_RS485_Tx_Pin(),
+-                     MSTP_RS485_Rx_Pin(),
+-                     MSTP_RS485_De_Pin(),
+-                     (unsigned)USER_MSTP_MAC_ADDRESS,
+-                     (unsigned)USER_MSTP_BAUD_RATE);
+-
+-            datalink_set(datalink_mstp);
+-            if (!datalink_init((char *)&mstp_port)) {
+-                ESP_LOGE(TAG, "Failed to initialize BACnet MS/TP datalink interface");
+-            }
+-        }
+-    }
+-#else
+-    ESP_LOGI(TAG, "BACnet MS/TP initialization skipped (MAX485 disabled)");
+-#endif
+-#else
+-    ESP_LOGI(TAG, "BACnet MS/TP compile-time disabled (USER_ENABLE_MSTP=0)");
+-#endif
+-
+-    if (USER_ENABLE_BACNET_IP && !USER_ENABLE_ETHERNET) {
+-        datalink_default = datalink_bip;
+-    }
+-#if !SKIP_PERIPHERALS
+-    else if (USER_ENABLE_BACNET_MSTP) {
+-        datalink_default = datalink_mstp;
+-    }
+-#endif
+-    if (datalink_default) {
+-        datalink_set(datalink_default);
+-    }
+-
+-    Device_Init(NULL);
+-    Device_Set_Object_Instance_Number(USER_BACNET_DEVICE_INSTANCE);
+-    Device_Set_Vendor_Identifier(260);
+-    Device_Object_Name_ANSI_Init(USER_BACNET_DEVICE_NAME);
+-
+-    /* Register service handlers - using bacnet-stack library handlers */
+-    ESP_LOGI(TAG, "Registering BACnet service handlers");
+-    apdu_set_unconfirmed_handler(SERVICE_UNCONFIRMED_I_AM, handler_i_am_add);
+-    apdu_set_unconfirmed_handler(SERVICE_UNCONFIRMED_WHO_IS, handler_who_is);
+-    apdu_set_unrecognized_service_handler_handler(handler_unrecognized_service);
+-    /* Read Property - REQUIRED for BACnet devices */
+-    apdu_set_confirmed_handler(SERVICE_CONFIRMED_READ_PROPERTY, handler_read_property);
+-    apdu_set_confirmed_handler(SERVICE_CONFIRMED_READ_PROP_MULTIPLE, handler_read_property_multiple);
+-    apdu_set_confirmed_handler(SERVICE_CONFIRMED_WRITE_PROPERTY, handler_write_property);
+-    apdu_set_confirmed_handler(SERVICE_CONFIRMED_SUBSCRIBE_COV, handler_cov_subscribe);
+-    apdu_set_confirmed_handler(SERVICE_CONFIRMED_SUBSCRIBE_COV_PROPERTY, handler_cov_subscribe_property);
+-
+-    /* Initialize COV subscription list */
+-    handler_cov_init();
+-
+-    /* Create BACnet objects (AV, BV, AI, BI, BO) */
+-    bacnet_create_analog_values();
+-    bacnet_create_binary_values();
+-    bacnet_create_analog_inputs();
+-    bacnet_create_binary_inputs();
+-    bacnet_create_binary_outputs_with_gpio_sync();  /* Create BO with GPIO sync task */
+-
+-    ESP_LOGI(TAG, "Initializing bacnet_io link and Waveshare IO");
+-    bacnet_io_link_init();
+-
+-    ESP_LOGI(TAG, "Broadcasting I-Am");
+-    if (USER_ENABLE_BACNET_IP) {
+-        if (USER_ENABLE_ETHERNET) {
+-            ESP_LOGI(TAG, "Deferring BACnet/IP I-Am until Ethernet IP and socket are ready");
+-        } else {
+-            bacnet_datalink_lock(datalink_bip);
+-            Send_I_Am(Handler_Transmit_Buffer);
+-            bacnet_datalink_unlock();
+-        }
+-    }
+-#if USER_ENABLE_MSTP
+-    if (USER_ENABLE_BACNET_MSTP) {
+-        bacnet_datalink_lock(datalink_mstp);
+-        Send_I_Am(Handler_Transmit_Buffer);
+-        bacnet_datalink_unlock();
+-    }
+-#endif
+-
+-    /* Start BACnet IO link task to sync BO->DO and DI->BI periodically */
+-    if (xTaskCreate(bacnet_io_link_task, "bacnet_io", 4096, NULL, tskIDLE_PRIORITY + 2, NULL) != pdPASS) {
+-        ESP_LOGE(TAG, "Failed to create bacnet_io_link task");
+-    } else {
+-        ESP_LOGI(TAG, "bacnet_io_link task started");
+-    }
+-
+-    /* Initialize display */
+-    ESP_LOGI(TAG, "Initializing display");
+-#if !SKIP_PERIPHERALS
+-    display_init();
+-#else
+-    ESP_LOGI(TAG, "Display init skipped (TFT disabled)");
+-#endif
+-
+-    /* Start BACnet receive task to handle incoming messages */
+-    if (USER_ENABLE_BACNET_IP) {
+-        if (xTaskCreate(bacnet_receive_task, "bacnet_rx", 16384, NULL, 5, NULL) != pdPASS) {
+-            ESP_LOGE(TAG, "Failed to create bacnet_rx task");
+-        }
+-    }
+-#if USER_ENABLE_MSTP
+-#if !SKIP_PERIPHERALS
+-    if (USER_ENABLE_BACNET_MSTP) {
+-        if (xTaskCreate(bacnet_mstp_receive_task, "bacnet_mstp_rx", 12288, NULL, 5, NULL) != pdPASS) {
+-            ESP_LOGE(TAG, "Failed to create bacnet_mstp_rx task");
+-        }
+-    }
+-#else
+-    (void)bacnet_mstp_receive_task; /* keep symbol referenced when disabled */
+-#endif
+-#else
+-    (void)bacnet_mstp_receive_task;
+-#endif
+-    if (xTaskCreate(bacnet_cov_task, "bacnet_cov", 24576, NULL, 4, &bacnet_cov_task_handle) != pdPASS) {
+-        ESP_LOGE(TAG, "Failed to create bacnet_cov task");
+-    }
+-#if !SKIP_PERIPHERALS
+-    if (xTaskCreate(sen54_task, "sen54", 4096, NULL, 3, NULL) != pdPASS) {
+-        ESP_LOGE(TAG, "Failed to create sen54 task");
+-    }
+-#else
+-    ESP_LOGI(TAG, "SEN54 task creation skipped (sensor disabled)");
+-#endif
+-
+-    if (USER_ENABLE_BACNET_MSTP) {
+-        ESP_LOGI(TAG, "BACnet MS/TP ready");
+-    }
+-
+-    /* Keep the task alive - maintenance + display updates */
+-    uint32_t display_tick = 0;
+-    uint32_t iam_tick = 0;
+-    uint32_t mstp_rx_tick = 0;
+-    uint32_t mstp_last_seen_pdu = 0;
+-    uint8_t mstp_alive_ticks = 0;
+-    while (1) {
+-        if (USER_ENABLE_BACNET_IP) {
+-            bacnet_datalink_lock(datalink_bip);
+-            datalink_maintenance_timer(1);
+-            bacnet_datalink_unlock();
+-        }
+-
+-        if (USER_ENABLE_BACNET_MSTP && ++iam_tick % 60 == 0) {
+-            bacnet_datalink_lock(datalink_mstp);
+-            Send_I_Am(Handler_Transmit_Buffer);
+-            bacnet_datalink_unlock();
+-        }
+-
+-        if (USER_ENABLE_BACNET_MSTP && ++mstp_rx_tick % 30 == 0) {
+-            MSTP_RS485_Rx_Bytes_Get_Reset();
+-            MSTP_RS485_Preamble_Counts_Get_Reset(NULL, NULL);
+-            mstp_pdu_count = 0;
+-            mstp_apdu_count = 0;
+-            mstp_rp_total = 0;
+-            mstp_wp_total = 0;
+-        }
+-
+-        if (USER_ENABLE_BACNET_MSTP) {
+-            if (mstp_pdu_count != mstp_last_seen_pdu) {
+-                mstp_last_seen_pdu = mstp_pdu_count;
+-                mstp_alive_ticks = 6;
+-            } else if (mstp_alive_ticks > 0) {
+-                mstp_alive_ticks--;
+-            }
+-        } else {
+-            mstp_alive_ticks = 0;
+-        }
+-
+-        display_set_link_status(
+-            wifi_connected_now(),
+-            USER_ENABLE_BACNET_MSTP && (mstp_alive_ticks > 0));
+-        
+-        /* Update display every 2 seconds */
+-        if (++display_tick % 2 == 0) {
+-            float av1 = Analog_Value_Present_Value(1);
+-            float av2 = Analog_Value_Present_Value(2);
+-            float av3 = Analog_Value_Present_Value(3);
+-            float av4 = Analog_Value_Present_Value(4);
+-            char ip_text[20];
+-            wifi_ip_string_now(ip_text, sizeof(ip_text));
+-            display_update_values(av1, av2, av3, av4);
+-            display_update_footer(USER_BACNET_DEVICE_INSTANCE, ip_text);
+-        }
+-        
+-        vTaskDelay(pdMS_TO_TICKS(1000));
+-    }
+-}
++/* Removed: duplicate old app_main() - preserved the new staged app_main() at file top. */
+ 
+ /* COV task - handles COV timer and notifications */
+-static void bacnet_cov_task(void *pvParameters)
++static void __attribute__((unused)) bacnet_cov_task(void *pvParameters)
+ {
+     (void)pvParameters;
+     while (1) {
+         char *active_datalink = datalink_default;
+         if (!active_datalink) {
+-            if (USER_ENABLE_BACNET_IP) {
++            if (bacnet_ip_initialized && (USER_ENABLE_BACNET_IP_ETHERNET || USER_ENABLE_BACNET_IP_WIFI)) {
+                 active_datalink = datalink_bip;
+             } else if (USER_ENABLE_BACNET_MSTP) {
+                 active_datalink = datalink_mstp;
+             }
+         }
+ 
+         if (active_datalink) {
+-            bacnet_datalink_lock(active_datalink);
+-            handler_cov_timer_seconds(1);
+-            handler_cov_task();
+-            bacnet_datalink_unlock();
++            if (bacnet_datalink_lock(active_datalink)) {
++                handler_cov_timer_seconds(1);
++                handler_cov_task();
++                bacnet_datalink_unlock();
++            }
+         } else {
+             handler_cov_timer_seconds(1);
+         }
+ 
+         vTaskDelay(pdMS_TO_TICKS(1000));
+     }
+ }
+ 
+ /* SEN54 task - reads sensor data and writes to BACnet Analog Value objects
+  *
+  * PERIPHERAL-TO-BACNET MAPPING:
+  * - AV1 (instance 1): Temperature (°C)
+  * - AV2 (instance 2): Relative Humidity (%RH)
+  * - AV3 (instance 3): PM2.5 concentration (μg/m³)
+  * - AV4 (instance 4): VOC Index (dimensionless)
+  */
++#if ENABLE_SEN54 && !SKIP_PERIPHERALS
+ static void sen54_task(void *pvParameters)
+ {
+     (void)pvParameters;
+     sen54_data_t sensor_data;
+     uint8_t consecutive_failures = 0;
+ 
+     /* Give SEN54 time to boot after power-up */
+     vTaskDelay(pdMS_TO_TICKS(3000));
+ 
+     sen54_init();
+ 
+     /* Wait for the sensor fan and particle chamber to stabilize */
+     vTaskDelay(pdMS_TO_TICKS(5000));
+ 
+@@ -679,24 +727,195 @@ static void sen54_task(void *pvParameters)
+             Analog_Value_Present_Value_Set(7, -1.0f, 16);
+ 
+             if (consecutive_failures >= 5) {
+                 ESP_LOGW(TAG, "SEN54 read failed %u times, reinitializing sensor",
+                          (unsigned)consecutive_failures);
+                 sen54_init();
+                 consecutive_failures = 0;
+                 vTaskDelay(pdMS_TO_TICKS(1500));
+             }
+         }
+ 
+         vTaskDelay(pdMS_TO_TICKS(2000));
+     }
+ }
++#endif
+ 
+ static void bacnet_register_with_bbmd(void)
+ {
+     BACNET_IP_ADDRESS bbmd_addr = { { USER_BBMD_IP_OCTET_1, USER_BBMD_IP_OCTET_2,
+                                      USER_BBMD_IP_OCTET_3, USER_BBMD_IP_OCTET_4 },
+                                     USER_BBMD_PORT };
+     int result = bvlc_register_with_bbmd(&bbmd_addr, USER_BBMD_TTL_SECONDS);
+     ESP_LOGI(TAG, "BBMD register result: %d", result);
+     /* BBMD registration no longer changes RGB status */
+ }
++
++static void bacnet_bip_network_ready(void)
++{
++    if (bacnet_ip_initialized) {
++        return;
++    }
++
++    bacnet_ip_initialized = true;
++    datalink_default = datalink_bip;
++    bacnet_register_with_bbmd();
++    bacnet_start_receive_task();
++    Send_I_Am(&Handler_Transmit_Buffer[0]);
++#if USER_ENABLE_RGB_STATUS
++    rgb_status_set_bacnet_ready();
++#endif
++}
++
++void bacnet_network_notify(uint32_t event_bits)
++{
++    if (bacnet_network_event_group) {
++        xEventGroupSetBits(bacnet_network_event_group, event_bits);
++    }
++}
++
++static esp_err_t bacnet_start_bip_on_interface(const char *ifkey, const char *label)
++{
++    if (!bacnet_update_bip_addresses(ifkey, label)) {
++        return ESP_FAIL;
++    }
++
++    if (!bacnet_bip_initialized) {
++        ESP_LOGI(TAG, "Initializing BACnet/IP datalink once on %s", label);
++        datalink_set(datalink_bip);
++        if (!datalink_init((char *)ifkey)) {
++            ESP_LOGE(TAG, "Failed to initialize BACnet datalink on %s", label);
++            return ESP_FAIL;
++        }
++        bacnet_bip_initialized = true;
++        bacnet_bip_network_ready();
++    }
++
++    if (!bacnet_active_ifkey || strcmp(bacnet_active_ifkey, ifkey) != 0) {
++        ESP_LOGI(TAG, "BACnet transport preference switched to %s", label);
++        bacnet_active_ifkey = ifkey;
++    }
++
++    datalink_default = datalink_bip;
++    return ESP_OK;
++}
++
++static bool bacnet_update_bip_addresses(const char *ifkey, const char *label)
++{
++    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(ifkey);
++    if (netif == NULL) {
++        ESP_LOGW(TAG, "BACnet/IP cannot use %s: netif %s not found", label, ifkey);
++        return false;
++    }
++
++    esp_netif_ip_info_t ip_info = {0};
++    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
++        ESP_LOGW(TAG, "BACnet/IP cannot use %s: no valid IP", label);
++        return false;
++    }
++
++    uint32_t ip_addr_val = ntohl(ip_info.ip.addr);
++    uint32_t netmask_val = ntohl(ip_info.netmask.addr);
++    uint32_t broadcast_val = (ip_addr_val & netmask_val) | (~netmask_val);
++
++    BACNET_IP_ADDRESS my_addr = {{0, 0, 0, 0}, 0xBAC0};
++    BACNET_IP_ADDRESS bcast_addr = {{255, 255, 255, 255}, 0xBAC0};
++
++    my_addr.address[0] = (uint8_t)((ip_addr_val >> 24) & 0xFF);
++    my_addr.address[1] = (uint8_t)((ip_addr_val >> 16) & 0xFF);
++    my_addr.address[2] = (uint8_t)((ip_addr_val >> 8) & 0xFF);
++    my_addr.address[3] = (uint8_t)(ip_addr_val & 0xFF);
++
++    bcast_addr.address[0] = (uint8_t)((broadcast_val >> 24) & 0xFF);
++    bcast_addr.address[1] = (uint8_t)((broadcast_val >> 16) & 0xFF);
++    bcast_addr.address[2] = (uint8_t)((broadcast_val >> 8) & 0xFF);
++    bcast_addr.address[3] = (uint8_t)(broadcast_val & 0xFF);
++
++    bip_set_addr(&my_addr);
++    bip_set_broadcast_addr(&bcast_addr);
++
++    ESP_LOGI(TAG, "BACnet/IP %s selected: ip=%u.%u.%u.%u bcast=%u.%u.%u.%u",
++             label,
++             (unsigned)my_addr.address[0],
++             (unsigned)my_addr.address[1],
++             (unsigned)my_addr.address[2],
++             (unsigned)my_addr.address[3],
++             (unsigned)bcast_addr.address[0],
++             (unsigned)bcast_addr.address[1],
++             (unsigned)bcast_addr.address[2],
++             (unsigned)bcast_addr.address[3]);
++    return true;
++}
++
++static void bacnet_network_select_transport(void)
++{
++    const char *ifkey = NULL;
++    const char *label = NULL;
++
++    if (bacnet_eth_has_ip && USER_ENABLE_BACNET_IP_ETHERNET) {
++        ifkey = "ETH_DEF";
++        label = "Ethernet";
++    } else if (bacnet_wifi_has_ip && USER_ENABLE_BACNET_IP_WIFI) {
++        ifkey = "WIFI_STA_DEF";
++        label = "WiFi";
++    }
++
++    if (ifkey == NULL) {
++        ESP_LOGW(TAG, "No BACnet-capable interface currently available; keeping BACnet stack initialized");
++        bacnet_active_ifkey = NULL;
++        return;
++    }
++
++    (void)bacnet_start_bip_on_interface(ifkey, label);
++}
++
++static void bacnet_eth_event_handler(void *arg, esp_event_base_t event_base,
++                                     int32_t event_id, void *event_data)
++{
++    (void)arg;
++    (void)event_data;
++
++    if (event_base == ETH_EVENT) {
++        if (event_id == ETHERNET_EVENT_DISCONNECTED || event_id == ETHERNET_EVENT_STOP) {
++            bacnet_network_notify(BACNET_NETWORK_EVT_ETH_LOST_IP);
++        }
++    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
++        bacnet_network_notify(BACNET_NETWORK_EVT_ETH_GOT_IP);
++    }
++}
++
++static void bacnet_network_task(void *pvParameters)
++{
++    (void)pvParameters;
++
++    ESP_LOGI(TAG, "BACnet network task running: handle=%p core=%d", (void *)xTaskGetCurrentTaskHandle(), xPortGetCoreID());
++    for (;;) {
++        EventBits_t bits = xEventGroupWaitBits(
++            bacnet_network_event_group,
++            BACNET_NETWORK_EVT_ETH_GOT_IP |
++            BACNET_NETWORK_EVT_ETH_LOST_IP |
++            BACNET_NETWORK_EVT_WIFI_GOT_IP |
++            BACNET_NETWORK_EVT_WIFI_LOST_IP,
++            pdTRUE,
++            pdFALSE,
++            portMAX_DELAY);
++
++        if (bits & BACNET_NETWORK_EVT_ETH_GOT_IP) {
++            bacnet_eth_has_ip = true;
++            ESP_LOGI(TAG, "Network task: Ethernet got IP");
++        }
++        if (bits & BACNET_NETWORK_EVT_ETH_LOST_IP) {
++            bacnet_eth_has_ip = false;
++            ESP_LOGI(TAG, "Network task: Ethernet lost IP");
++        }
++        if (bits & BACNET_NETWORK_EVT_WIFI_GOT_IP) {
++            bacnet_wifi_has_ip = true;
++            ESP_LOGI(TAG, "Network task: WiFi got IP");
++        }
++        if (bits & BACNET_NETWORK_EVT_WIFI_LOST_IP) {
++            bacnet_wifi_has_ip = false;
++            ESP_LOGI(TAG, "Network task: WiFi lost IP");
++        }
++
++        bacnet_network_select_transport();
++    }
++}

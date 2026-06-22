@@ -14,6 +14,8 @@ It provides a fully operational **multi-transport BACnet gateway** with determin
 
 The system is designed for industrial field deployment with resilient multi-network operation.
 
+All system configuration parameters are user-customizable in `main/User_Settings.c`, including network interfaces, device identity, and optional feature flags.
+
 ---
 
 # 🟦 1. Hardware Specification

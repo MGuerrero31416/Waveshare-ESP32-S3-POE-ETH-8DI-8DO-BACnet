@@ -304,7 +304,6 @@ Verified behaviors:
 
 ### Pending Field Validation
 
-- Cold boot with Ethernet physically disconnected  
 - Long-duration stress testing (10+ failover cycles)  
 - Explicit I-Am logging verification in field trace  
 - MS/TP interoperability testing with JCI NAE  

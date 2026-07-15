@@ -1,12 +1,8 @@
-# BACnet firmware for WAVESHARE ESP32-S3-POE-ETH-8DI-8DO
+# ESP3-S3 BACnet device with SEN54 Air Quality Sensor
 
-This is a code to add BACnet to the WAVESHARE ESP32-S3-POE-ETH-8DI-8DO
 ESP32-S3 based BACnet/IP device featuring 23 BACnet objects: 7 Analog Values, 4 Binary Values, 4 Analog Inputs, 4 Binary Inputs, and 4 Binary Outputs. .
 
 It can simultaneously connect the BACnet device through WiFi (BACnet/IP), WiFi to Ethernet bridge, and MS/TP 
-
-Bacnet BO 1-8 are linked to Waveshare DO 1-8
-Bacnet BI 1-8 are linked to Waveshare DI 1-8
 
 ## Features
 
@@ -34,11 +30,6 @@ Bacnet BI 1-8 are linked to Waveshare DI 1-8
 ![Device](docs/images/03.jpg)
 ![Device](docs/images/04.jpg)
 ![Wiring](docs/images/ESP32-SEN54_WROM32_pinout.jpg)
-
-
-## Hardware Requirements
-
-WAVESHARE ESP32-S3-POE-ETH-8DI-8D 
 
 ## Hardware Components
 

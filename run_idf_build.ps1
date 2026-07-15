@@ -1,13 +1,35 @@
-$py='C:\Espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe'
-$idf_path='C:\Espressif\frameworks\esp-idf-v5.5.1'
+if ($env:IDF_PATH) {
+	$idf_path = $env:IDF_PATH
+} else {
+	$idf_path = 'C:\Espressif\frameworks\esp-idf-v5.5.1'
+}
+
+if ($env:IDF_PYTHON) {
+	$py = $env:IDF_PYTHON
+} else {
+	$py = 'C:\Espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe'
+}
+
 $activate = Join-Path $idf_path 'tools\activate.py'
+if (-Not (Test-Path $activate)) {
+	Write-Host "ERROR: ESP-IDF activate script not found at $activate" -ForegroundColor Red
+	Write-Host "Set the IDF_PATH environment variable to your ESP-IDF install, e.g. setx IDF_PATH C:\path\to\esp-idf" -ForegroundColor Yellow
+	exit 1
+}
+
 Write-Host "Using python: $py"
 Write-Host "Running activate: $activate"
 $exports = & $py $activate --export
 $exports | Out-File -FilePath idf_export.ps1 -Encoding ASCII
 Write-Host "Sourcing exported environment"
 . .\idf_export.ps1
+
 $idf_script = Join-Path $idf_path 'tools\idf.py'
+if (-Not (Test-Path $idf_script)) {
+	Write-Host "ERROR: idf.py not found at $idf_script" -ForegroundColor Red
+	exit 1
+}
+
 Write-Host "Running: $py $idf_script fullclean"
 & $py $idf_script fullclean
 Write-Host "Running: $py $idf_script build"
